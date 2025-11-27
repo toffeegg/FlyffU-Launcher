@@ -1,5 +1,7 @@
 // main.js
-const { app, BrowserWindow, ipcMain, session, dialog, globalShortcut, shell, nativeImage } = require('electron');
+// Source reference: :contentReference[oaicite:0]{index=0}
+
+const { app, BrowserWindow, BrowserView, ipcMain, session, dialog, globalShortcut, shell, nativeImage, webContents } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
@@ -7,9 +9,41 @@ const pkg = require('./package.json');
 
 let launcherWin = null;
 let quittingApp = false;
+let currentActiveTabProfile = null;
 
-const gameWindows = new Map();
+function disableBrowserShortcuts(wc) {
+  if (!wc) return;
 
+  wc.on('before-input-event', (event, input) => {
+    const ctrl = input.control || input.meta;
+
+    // ✔ allow Ctrl+Tab and Ctrl+Shift+Tab for tab switching
+    if (ctrl && input.key === 'Tab') {
+      return; 
+    }
+
+    if (ctrl) {
+      switch (input.key.toLowerCase()) {
+        case 'w':   // Ctrl+W → block close
+        case 'r':   // Ctrl+R / Reload
+        case 'i':   // Ctrl+Shift+I devtools
+        case 'l':   // Ctrl+L
+        case 'f':   // Ctrl+F
+          event.preventDefault();
+          break;
+      }
+    }
+
+    if (input.key.toLowerCase() === 'f5') {
+      event.preventDefault();
+    }
+  });
+}
+
+const gameWindows = new Map(); // profileName -> Set of BrowserWindow (standalone)
+const browserViewsMap = new Map(); // profileName -> BrowserView
+const tabWebContentsMap = new Map(); // profileName -> webContentsId (tabs in tabHost)
+const tabHostRegisteredTabs = new Map(); // profileName -> tabId (internal tab mapping)
 const LEGACY_DIRNAME = 'FlyffU Launcher';
 const appData = app.getPath('appData');
 const legacyUserData = path.join(appData, LEGACY_DIRNAME);
@@ -30,27 +64,8 @@ try { fs.mkdirSync(SHOTS_DIR, { recursive: true }); } catch {}
 
 // Jobs
 const JOBS = [
-  'Vagrant',
-  'Acrobat',
-  'Jester',
-  'Ranger',
-  'Harlequin',
-  'Crackshooter',
-  'Assist',
-  'Ringmaster',
-  'Billposter',
-  'Seraph',
-  'Force Master',
-  'Magician',
-  'Psykeeper',
-  'Elementor',
-  'Mentalist',
-  'Arcanist',
-  'Mercenary',
-  'Blade',
-  'Knight',
-  'Slayer',
-  'Templar'
+  'Vagrant','Acrobat','Jester','Ranger','Harlequin','Crackshooter','Assist','Ringmaster','Billposter',
+  'Seraph','Force Master','Magician','Psykeeper','Elementor','Mentalist','Arcanist','Mercenary','Blade','Knight','Slayer','Templar'
 ];
 const JOBS_SET = new Set(JOBS);
 const DEFAULT_JOB = 'Vagrant';
@@ -94,7 +109,7 @@ if (!gotTheLock) {
 
 // ---------- Profiles storage helpers ----------
 
-/** @typedef {{name:string, job:string, partition:string, frame?:boolean, isClone?:boolean, winState?:{bounds?:{x?:number,y?:number,width:number,height:number}, isMaximized?:boolean}, muted?:boolean}} Profile */
+/** @typedef {{name:string, job:string, partition:string, frame?:boolean, isClone?:boolean, winState?:{bounds?:{x?:number,y?:number,width:number,height:number}, isMaximized?:boolean}, muted?:boolean, tab?:boolean}} Profile */
 
 function readRawProfiles() {
   try {
@@ -200,7 +215,9 @@ function normalizeProfiles(arr) {
           partition: partitionForProfile({ name }),
           frame: false,
           isClone: inferIsCloneFromName(name),
-          winState: undefined
+          winState: undefined,
+          muted: false,
+          tab: false
         };
       }
       const name = safeProfileName(item?.name);
@@ -211,7 +228,9 @@ function normalizeProfiles(arr) {
       const frame = !!item?.frame;
       const isClone = (typeof item?.isClone === 'boolean') ? item.isClone : inferIsCloneFromName(name);
       const winState = (item && typeof item.winState === 'object') ? sanitizeWinState(item.winState) : undefined;
-      return { name, job, partition, frame, isClone, winState, muted: !!item?.muted };
+      const muted = !!item?.muted;
+      const tab = !!item?.tab; // NEW: tab default false
+      return { name, job, partition, frame, isClone, winState, muted, tab };
     })
     .filter(Boolean);
 }
@@ -262,6 +281,10 @@ function getActiveProfileNames() {
   for (const [key, set] of gameWindows.entries()) {
     if (set && set.size > 0) names.push(key);
   }
+  // included tab host active profiles
+  for (const key of tabWebContentsMap.keys()) {
+    if (!names.includes(key)) names.push(key);
+  }
   return names;
 }
 
@@ -309,14 +332,19 @@ function updateGlobalShortcut() {
     // Mute/unmute current session
     globalShortcut.register('CommandOrControl+Shift+M', async () => {
       try {
-        let target = BrowserWindow.getFocusedWindow();
         let profileName = null;
+        let target = BrowserWindow.getFocusedWindow();
 
         if (target) {
           for (const [name, set] of gameWindows.entries()) {
             if (set && set.has(target)) { profileName = name; break; }
           }
         }
+
+		// If still not found, use active tab
+		if (!profileName && currentActiveTabProfile) {
+		profileName = currentActiveTabProfile;
+		}
 
         if (!profileName) {
           const all = [];
@@ -328,7 +356,30 @@ function updateGlobalShortcut() {
 
         if (profileName) {
           const wins = getAllGameWindowsForProfile(profileName);
-          if (!wins.length) return;
+          if (!wins.length) {
+            // if no standalone windows, check tab webContents and toggle via webContents
+            const wcId = tabWebContentsMap.get(profileName);
+            if (wcId) {
+              const wc = webContents.fromId(wcId);
+              if (wc) {
+                const currentlyMuted = wc.isAudioMuted();
+                const next = !currentlyMuted;
+                wc.setAudioMuted(next);
+                // update stored state
+                const list = readProfiles();
+                const idx = getProfileIndex(list, profileName);
+                if (idx !== -1) {
+                  list[idx].muted = next;
+                  writeProfiles(list);
+                }
+                if (launcherWin && !launcherWin.isDestroyed()) {
+                  launcherWin.webContents.send('profiles:audio-updated', { name: profileName, muted: next });
+                }
+                return;
+              }
+            }
+            return;
+          }
 
           const currentlyMuted = wins.every(w => w.webContents.isAudioMuted());
           const next = !currentlyMuted;
@@ -363,6 +414,7 @@ function updateGlobalShortcut() {
           if (w && !w.isDestroyed()) all.push(w);
         }
       }
+      // Note: Tab-host tabs are not part of BrowserWindow list; we only cycle standalone windows here.
       if (all.length < 2) return;
 
       const focused = BrowserWindow.getFocusedWindow();
@@ -646,6 +698,43 @@ async function captureScreenshotOfFocusedSession() {
       }
       target = all[all.length - 1];
     }
+	
+	async function saveScreenshot(image) {
+  try { await fs.promises.mkdir(SHOTS_DIR, { recursive: true }); } catch {}
+
+  const ts = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const filename = `FlyffU_${ts.getFullYear()}-${pad(ts.getMonth()+1)}-${pad(ts.getDate())}_${pad(ts.getHours())}-${pad(ts.getMinutes())}-${pad(ts.getSeconds())}.png`;
+  const out = path.join(SHOTS_DIR, filename);
+
+  const pngBuffer = image.toPNG();
+  await fs.promises.writeFile(out, pngBuffer);
+
+  if (launcherWin && !launcherWin.isDestroyed()) {
+    launcherWin.webContents.send('shots:done', { file: out });
+  }
+
+  return out;
+}
+
+
+// If still not found, check active tabbed session and capture the BrowserView contents
+if ((!target || target.isDestroyed()) && tabHostWin && !tabHostWin.isDestroyed()) {
+  if (currentActiveTabProfile) {
+    const view = browserViewsMap.get(currentActiveTabProfile);
+    if (view && view.webContents && !view.webContents.isDestroyed()) {
+      try {
+        const image = await view.webContents.capturePage();
+        if (image && !image.isEmpty()) {
+          await saveScreenshot(image);
+        }
+      } catch (e) {
+        console.error('Screenshot (tab view) failed:', e);
+      }
+    }
+  }
+  return;
+}
 
     if (!target || target.isDestroyed()) return;
 
@@ -740,8 +829,820 @@ async function showToastInWindow(win, message = 'Screenshot saved.') {
   try { await win.webContents.executeJavaScript(js, true); } catch {}
 }
 
-// ---------- UI ----------
+// ---------- Tab Host (BrowserWindow with BrowserView tabs) ----------
 
+let tabHostWin = null;
+
+// create data-URL html for tab host (renderer only manages UI and sends main messages to create/activate/close tabs)
+function tabHostHtml() {
+  const html = `
+  <!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>FlyffU Launcher - Tab Session</title>
+    <style>
+      :root{--bg:#0b0f16;--panel:#0f1624;--line:#1c2533;--text:#e6edf3;--accent:#2c8ae8}
+      *{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+      html,body{height:100%;margin:0;background:var(--bg);color:var(--text);display:flex;flex-direction:column}
+      .tabs { display:flex; gap:6px; padding:8px; align-items:center; border-bottom:1px solid var(--line); background:linear-gradient(0deg, rgba(15,21,32,0.9), rgba(15,21,32,0.6)); }
+      .tab { padding:6px 10px; border-radius:8px; background:#0f1624; border:1px solid #122033; cursor:pointer; min-width:70px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .tab.active { background:linear-gradient(90deg,#14263a,#0f2040); box-shadow:0 4px 14px rgba(0,0,0,0.45); border-left:3px solid var(--accent); }
+      .tab-close { margin-left:8px; color:#9aa7bd; cursor:pointer; font-weight:700 }
+      .tab-add { padding:6px 8px; border-radius:8px; background:#0f1624; border:1px dashed #182533; cursor:pointer; margin-left:auto; position:relative; }
+      .tab-add-menu { position:absolute; right:0; top:calc(100% + 8px); background:#0f1624; border:1px solid var(--line); border-radius:8px; box-shadow:0 10px 24px rgba(0,0,0,.4); min-width:220px; z-index:9999; display:none; flex-direction:column; padding:6px; }
+      .tab-add-menu.show { display:flex; }
+      .tab-add-menu .item { padding:8px 10px; cursor:pointer; border-radius:6px; font-size:13px; color:var(--text); }
+      .tab-add-menu .item:hover { background: rgba(44, 138, 232, 0.06); }
+      .tab-add-menu .item.disabled { color:#6f7b88; cursor:default; }
+      .webview-placeholder { flex:1; position:relative; overflow:hidden; min-height: 0; background: transparent; }
+      .titlebar { display:flex; align-items:center; gap:10px; padding:6px 8px; border-bottom:1px solid var(--line) }
+      .info { color:#9aa7bd; font-size:13px }
+    </style>
+  </head>
+  <body>
+    <div class="tabs" id="tabsBar">
+      <div id="tabButtons" style="display:flex;gap:6px;margin-left:8px"></div>
+      <div id="addBtn" class="tab-add">＋
+      </div>
+    </div>
+    <div class="webview-placeholder" id="webviewContainer"></div>
+    <script>
+      const { ipcRenderer } = require('electron');
+
+      const tabButtons = document.getElementById('tabButtons');
+      const addBtn = document.getElementById('addBtn');
+      const addMenu = document.getElementById('addMenu');
+
+      // internal state
+      const tabs = []; // { id: string, name: string, muted: boolean }
+      let activeId = null;
+
+      function createTabElement(tab) {
+        const el = document.createElement('div');
+        el.className = 'tab';
+        el.dataset.id = tab.id;
+        el.title = tab.name;
+        el.innerHTML = '<span style="display:inline-block;vertical-align:middle;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(tab.name) + '</span>';
+        const close = document.createElement('span');
+        close.className = 'tab-close';
+        close.innerHTML = '×';
+        close.addEventListener('click', (e) => {
+          e.stopPropagation();
+          ipcRenderer.invoke('tabs:confirm-close', { name: tab.name }).catch(()=>{});
+        });
+        el.appendChild(close);
+        el.addEventListener('click', () => {
+          activateTab(tab.id);
+        });
+        return el;
+      }
+
+      function escapeHtml(s) {
+        return String(s || '').replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); });
+      }
+
+      function addTabLocal(tab) {
+        tabs.push(tab);
+        const btn = createTabElement(tab);
+        tabButtons.appendChild(btn);
+        // activate the newly added tab
+        activateTab(tab.id);
+      }
+
+      function activateTab(id) {
+        activeId = id;
+        // update tab buttons
+        Array.from(tabButtons.children).forEach(ch => {
+          ch.classList.toggle('active', ch.dataset.id === id);
+        });
+        ipcRenderer.send('tabs:activated', { id: id, name: tabs.find(x => x.id === id)?.name });
+      }
+
+      function closeTab(id) {
+        const idx = tabs.findIndex(t => t.id === id);
+        if (idx === -1) return;
+        const t = tabs[idx];
+
+        // remove DOM
+        const btn = tabButtons.querySelector('[data-id="'+id+'"]');
+        if (btn) btn.remove();
+
+        tabs.splice(idx, 1);
+        ipcRenderer.send('tabs:closed', { id, name: t.name });
+
+        // activate neighbor
+        if (tabs.length) {
+          const nextIdx = Math.max(0, Math.min(idx, tabs.length - 1));
+          activateTab(tabs[nextIdx].id);
+        } else {
+          activeId = null;
+        }
+      }
+
+      // ipc listeners
+      ipcRenderer.on('tabs:create', (_e, data) => {
+        // data: { id, name, muted }
+        if (!data || !data.id) return;
+        // avoid duplicate
+        if (tabs.some(t => t.id === data.id)) {
+          activateTab(data.id);
+          return;
+        }
+        addTabLocal({ id: data.id, name: data.name, muted: !!data.muted });
+      });
+
+      ipcRenderer.on('tabs:focus', (_e, data) => {
+        if (!data || !data.id) return;
+        if (tabs.some(t => t.id === data.id)) {
+          activateTab(data.id);
+        }
+      });
+
+      ipcRenderer.on('tabs:close', (_e, data) => {
+        if (!data || !data.id) return;
+        closeTab(data.id);
+      });
+
+      ipcRenderer.on('tabs:mute', (_e, data) => {
+        if (!data || !data.id) return;
+        const t = tabs.find(x => x.id === data.id);
+        if (!t) return;
+        ipcRenderer.send('tabs:set-audio-muted', { name: t.name, muted: !!data.muted });
+      });
+
+      async function buildAddMenu() {
+        addMenu.innerHTML = '';
+        try {
+          const available = await ipcRenderer.invoke('tabs:list-available') || [];
+          if (!Array.isArray(available) || available.length === 0) {
+            const item = document.createElement('div');
+            item.className = 'item disabled';
+            item.textContent = 'No profiles available';
+            addMenu.appendChild(item);
+            return;
+          }
+          available.forEach(p => {
+            const item = document.createElement('div');
+            item.className = 'item';
+            item.textContent = p.name + (p.job ? (' — ' + p.job) : '');
+            item.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              try {
+                await ipcRenderer.invoke('tabs:create-for-profile', { name: p.name });
+              } catch (err) {}
+              addMenu.classList.remove('show');
+            });
+            addMenu.appendChild(item);
+          });
+        } catch (e) {
+          const item = document.createElement('div');
+          item.className = 'item disabled';
+          item.textContent = 'Failed to load';
+          addMenu.appendChild(item);
+        }
+      }
+
+	  addBtn.addEventListener('click', () => {
+      ipcRenderer.invoke('tabs:open-add-popup').catch(() => {});
+      });
+
+      // close window if asked
+      ipcRenderer.on('tabs:close-window', () => {
+        window.close();
+      });
+	  
+      // --- Ctrl+Tab / Ctrl+Shift+Tab switching ---
+        window.addEventListener('keydown', (e) => {
+        if (!tabs.length) return;
+      
+        const isCtrl = e.ctrlKey || e.metaKey;
+      
+        // Ctrl+Tab → next tab
+        if (isCtrl && !e.shiftKey && e.key === 'Tab') {
+          e.preventDefault();
+          if (!activeId) return;
+          const idx = tabs.findIndex(t => t.id === activeId);
+          if (idx === -1) return;
+          const nextIdx = (idx + 1) % tabs.length;
+          activateTab(tabs[nextIdx].id);
+          return;
+        }
+      
+        // Ctrl+Shift+Tab → previous tab
+        if (isCtrl && e.shiftKey && e.key === 'Tab') {
+          e.preventDefault();
+          if (!activeId) return;
+          const idx = tabs.findIndex(t => t.id === activeId);
+          if (idx === -1) return;
+          const prevIdx = (idx - 1 + tabs.length) % tabs.length;
+          activateTab(tabs[prevIdx].id);
+          return;
+        }
+      });
+	  
+	  ipcRenderer.on('tabs:hotkey', (_e, data) => {
+  if (!tabs.length || !activeId) return;
+  const idx = tabs.findIndex(t => t.id === activeId);
+  if (idx === -1) return;
+
+  if (data.shift) {
+    const prevIdx = (idx - 1 + tabs.length) % tabs.length;
+    activateTab(tabs[prevIdx].id);
+  } else {
+    const nextIdx = (idx + 1) % tabs.length;
+    activateTab(tabs[nextIdx].id);
+  }
+});
+
+
+      // helper: when window unload, inform main to cleanup registrations
+      window.addEventListener('beforeunload', () => {
+        const names = tabs.map(t => t.name);
+        ipcRenderer.send('tabs:host-closed', { names });
+      });
+    </script>
+  </body>
+  </html>
+  `;
+  return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+}
+
+function createTabHostWindow() {
+  if (tabHostWin && !tabHostWin.isDestroyed()) return tabHostWin;
+
+  tabHostWin = new BrowserWindow({
+    width: 1200,
+    height: 820,
+    autoHideMenuBar: true,
+    show: true,
+    frame: true,
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+      backgroundThrottling: true
+    }
+  });
+  
+  disableBrowserShortcuts(tabHostWin.webContents);
+  
+  tabHostWin.maximize();
+
+  tabHostWin.loadURL(tabHostHtml());
+  
+  tabHostWin.webContents.on('before-input-event', (event, input) => {
+  const ctrl = input.control || input.meta;
+  
+  if (ctrl && input.key === 'Tab') {
+    event.preventDefault();
+    tabHostWin.webContents.send('tabs:hotkey', {
+      shift: input.shift
+    });
+    }
+  });
+
+  // When the tab host is manually closed (X button)
+  tabHostWin.on('close', async (e) => {
+    if (quittingApp) return;
+
+    // If no tabs exist, allow normal close
+    if (tabHostRegisteredTabs.size === 0) return;
+
+    e.preventDefault();
+
+    // Same confirmation UI as closing a single tab or profile window
+    const res = await dialog.showMessageBox(tabHostWin, {
+      type: 'question',
+      buttons: ['Exit Tabbed Sessions', 'Exit FlyffU Launcher', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      title: 'Exit Session',
+      message: 'Exit all opened tab sessions?',
+      noLink: true,
+      normalizeAccessKeys: true
+    });
+
+    if (res.response === 0) {
+      // Exit Session → close all tabs
+      for (const [name] of Array.from(tabHostRegisteredTabs.entries())) {
+        closeTabForProfile(name);
+      }
+      return;
+    }
+
+    if (res.response === 1) {
+      // Exit FlyffU Launcher
+      exitAppNow();
+      return;
+    }
+
+    // Cancel → do nothing
+  });
+
+  tabHostWin.on('closed', () => {
+    // Destroy any leftover BrowserViews
+    try {
+      for (const [name, view] of browserViewsMap.entries()) {
+        try { if (view && view.webContents && !view.webContents.isDestroyed()) view.webContents.destroy(); } catch {}
+      }
+    } catch {}
+    browserViewsMap.clear();
+    tabWebContentsMap.clear();
+    tabHostRegisteredTabs.clear();
+    tabHostWin = null;
+    broadcastActiveUpdate();
+  });
+
+  tabHostWin.on('resize', () => {
+    try { resizeTabHostViews(); } catch (e) {}
+  });
+
+  return tabHostWin;
+}
+
+// Helper to generate a stable tab id for a profile
+function tabIdForProfile(name) {
+  return `tab:${name}`;
+}
+
+// Resize and position attached BrowserView to fit under tab bar
+function resizeTabHostViews() {
+  if (!tabHostWin || tabHostWin.isDestroyed()) return;
+  try {
+    const [width, height] = tabHostWin.getContentSize();
+    const tabBarHeight = 56; // must match renderer .tabs height + padding -> tuned value
+    const view = tabHostWin.getBrowserViews()[0];
+    if (view) {
+      const bounds = { x: 0, y: tabBarHeight, width, height: Math.max(100, height - tabBarHeight) };
+      view.setBounds(bounds);
+      view.setAutoResize({ width: true, height: true });
+    }
+  } catch (e) {
+    console.error('resizeTabHostViews failed', e);
+  }
+}
+
+// Create and attach BrowserView for a profile
+function createBrowserViewForProfile(profile) {
+  if (!profile) return null;
+  if (browserViewsMap.has(profile.name)) return browserViewsMap.get(profile.name);
+
+  try {
+    const part = partitionForProfile(profile);
+    const view = new BrowserView({
+      webPreferences: {
+        partition: part,
+        backgroundThrottling: false,
+        nativeWindowOpen: true
+      }
+    });
+	
+	// Forward Ctrl+Tab / Ctrl+Shift+Tab even when BrowserView is focused
+	view.webContents.on('before-input-event', (event, input) => {
+	  const ctrl = input.control || input.meta;
+	
+	  if (ctrl && input.key === 'Tab') {
+	    event.preventDefault();
+	    if (tabHostWin && !tabHostWin.isDestroyed()) {
+	      tabHostWin.webContents.send('tabs:hotkey', {
+	        shift: input.shift
+	      });
+	    }
+	  }
+	
+	});
+	
+	disableBrowserShortcuts(view.webContents);
+
+    // apply muted state after creating
+    try {
+      if (profile.muted) view.webContents.setAudioMuted(true);
+    } catch (e) {}
+
+    // load game
+    const url = 'https://universe.flyff.com/play';
+    try { view.webContents.loadURL(url); } catch (e) { console.error('BrowserView loadURL failed', e); }
+
+    browserViewsMap.set(profile.name, view);
+    try {
+      tabWebContentsMap.set(profile.name, view.webContents.id);
+    } catch (e) {
+      console.error('Failed setting tab webcontents id', e);
+    }
+
+    // Ensure view is properly focused when it finishes loading
+    view.webContents.once('dom-ready', () => {
+      try {
+        if (!tabHostWin || tabHostWin.isDestroyed()) return;
+        // If this view is currently attached, ensure resize and focus
+        const attached = tabHostWin.getBrowserViews().includes(view);
+        if (attached) {
+          resizeTabHostViews();
+          try { view.webContents.focus(); } catch (e) {}
+        }
+      } catch (e) {}
+    });
+
+    // If the view's webContents is destroyed, cleanup maps
+    view.webContents.on('destroyed', () => {
+      try {
+        tabWebContentsMap.delete(profile.name);
+        browserViewsMap.delete(profile.name);
+        tabHostRegisteredTabs.delete(profile.name);
+        if (tabHostWin && !tabHostWin.isDestroyed()) {
+          try { tabHostWin.webContents.send('tabs:close', { id: tabIdForProfile(profile.name) }); } catch {}
+        }
+        broadcastActiveUpdate();
+      } catch (e) {}
+    });
+
+    return view;
+  } catch (e) {
+    console.error('createBrowserViewForProfile failed', e);
+    return null;
+  }
+}
+
+// Attach (show) a BrowserView by profile name in the tab host
+function attachBrowserViewForProfile(name) {
+  if (!tabHostWin || tabHostWin.isDestroyed()) return;
+  try {
+    // remove any existing browser views
+    const current = tabHostWin.getBrowserViews();
+    for (const cv of current) {
+      try { tabHostWin.removeBrowserView(cv); } catch (e) {}
+    }
+
+    const view = browserViewsMap.get(name);
+    if (!view) {
+      const p = getProfileByName(name);
+      if (!p) return;
+      createBrowserViewForProfile(p);
+    }
+
+    const toAttach = browserViewsMap.get(name);
+    if (!toAttach) return;
+
+    tabHostWin.setBrowserView(toAttach);
+    resizeTabHostViews();
+
+    try { toAttach.webContents.focus(); } catch (e) {}
+  } catch (e) {
+    console.error('attachBrowserViewForProfile failed', e);
+  }
+}
+
+// Ensure tab host exists and create a tab for profile
+function ensureTabAndCreateForProfile(profile) {
+  const host = createTabHostWindow();
+  const id = tabIdForProfile(profile.name);
+  try {
+    // create BrowserView early
+    createBrowserViewForProfile(profile);
+    // send message to renderer to add tab UI
+    try {
+      host.webContents.send('tabs:create', { id, name: profile.name, muted: !!profile.muted });
+      tabHostRegisteredTabs.set(profile.name, id);
+    } catch (e) {
+      console.error('Failed to send tabs:create to host', e);
+    }
+  } catch (e) {
+    console.error('ensureTabAndCreateForProfile failed', e);
+  }
+  broadcastActiveUpdate();
+}
+
+// Close tab if exists for profile
+function closeTabForProfile(profileName) {
+  const id = tabIdForProfile(profileName);
+  if (tabHostWin && !tabHostWin.isDestroyed()) {
+    try {
+      tabHostWin.webContents.send('tabs:close', { id });
+    } catch (e) {}
+  }
+  // destroy BrowserView if exists
+  const view = browserViewsMap.get(profileName);
+  if (view) {
+    try {
+      // if attached, remove first
+      if (tabHostWin && !tabHostWin.isDestroyed()) {
+        try { tabHostWin.removeBrowserView(view); } catch {}
+      }
+    } catch {}
+    try { if (view.webContents && !view.webContents.isDestroyed()) view.webContents.destroy(); } catch {}
+    try { browserViewsMap.delete(profileName); } catch {}
+  }
+  // also remove webcontents id
+  tabWebContentsMap.delete(profileName);
+  tabHostRegisteredTabs.delete(profileName);
+  broadcastActiveUpdate();
+}
+
+// Focus tab for profile
+function focusTabForProfile(profileName) {
+  const id = tabIdForProfile(profileName);
+  if (tabHostWin && !tabHostWin.isDestroyed()) {
+    try { tabHostWin.webContents.send('tabs:focus', { id }); } catch (e) {}
+    // bring host to front and attach BrowserView
+    try { tabHostWin.show(); tabHostWin.focus(); } catch {}
+    try { attachBrowserViewForProfile(profileName); } catch (e) {}
+    return { ok: true };
+  }
+  return { ok: false, error: 'No tab host' };
+}
+
+// Close whole tab host
+function closeTabHostWindow() {
+  if (tabHostWin && !tabHostWin.isDestroyed()) {
+    try { tabHostWin.close(); } catch (e) {}
+  }
+}
+
+ipcMain.on('tabs:activated', (_e, { id, name }) => {
+  if (!name) return;
+
+  // NEW — store active tab profile
+  currentActiveTabProfile = name;
+
+  attachBrowserViewForProfile(name);
+
+  if (!tabHostRegisteredTabs.has(name)) {
+    tabHostRegisteredTabs.set(name, tabIdForProfile(name));
+  }
+  broadcastActiveUpdate();
+});
+
+ipcMain.on('tabs:closed', (_e, { id, name }) => {
+  if (!name) return;
+  // destroy corresponding view and cleanup
+  const view = browserViewsMap.get(name);
+  if (view) {
+    try {
+      if (tabHostWin && !tabHostWin.isDestroyed()) tabHostWin.removeBrowserView(view);
+    } catch {}
+    try { if (view.webContents && !view.webContents.isDestroyed()) view.webContents.destroy(); } catch {}
+    browserViewsMap.delete(name);
+  }
+  tabWebContentsMap.delete(name);
+  tabHostRegisteredTabs.delete(name);
+  broadcastActiveUpdate();
+
+if (tabHostRegisteredTabs.size === 0) {
+
+  // If app is exiting, do NOT reopen launcher
+  if (quittingApp) {
+    if (tabHostWin && !tabHostWin.isDestroyed()) {
+      tabHostWin.close();
+    }
+    return;
+  }
+
+  if (tabHostWin && !tabHostWin.isDestroyed()) {
+    tabHostWin.close();
+  }
+  ensureLauncher();
+  if (launcherWin && !launcherWin.isDestroyed()) {
+    launcherWin.show();
+    launcherWin.focus();
+  }
+}
+
+});
+
+ipcMain.on('tabs:host-closed', (_e, { names }) => {
+  // renderer informs host closing; cleanup
+  if (Array.isArray(names)) {
+    for (const n of names) {
+      try {
+        const view = browserViewsMap.get(n);
+        if (view) {
+          try { if (view.webContents && !view.webContents.isDestroyed()) view.webContents.destroy(); } catch {}
+          browserViewsMap.delete(n);
+        }
+      } catch {}
+      tabWebContentsMap.delete(n);
+      tabHostRegisteredTabs.delete(n);
+    }
+  }
+  broadcastActiveUpdate();
+});
+
+ipcMain.on('tabs:set-audio-muted', async (_e, { name, muted }) => {
+  try {
+    if (!name) return;
+    // try BrowserView first
+    const view = browserViewsMap.get(name);
+    if (view && view.webContents) {
+      try { view.webContents.setAudioMuted(!!muted); } catch {}
+    }
+    const wcId = tabWebContentsMap.get(name);
+    if (wcId) {
+      try {
+        const wc = webContents.fromId(wcId);
+        if (wc) wc.setAudioMuted(!!muted);
+      } catch (e) {}
+    }
+    // update stored state
+    for (const list of [readProfiles()]) {
+      const idx = getProfileIndex(list, name);
+      if (idx !== -1) {
+        list[idx].muted = !!muted;
+        writeProfiles(list);
+        if (launcherWin && !launcherWin.isDestroyed()) {
+          launcherWin.webContents.send('profiles:audio-updated', { name, muted: !!muted });
+        }
+        break;
+      }
+    }
+  } catch (e) {
+    console.error('tabs:set-audio-muted failed', e);
+  }
+});
+
+// New: provide list of available profiles that can be added as tabs (tab:true and not currently open)
+ipcMain.handle('tabs:list-available', async () => {
+  try {
+    const list = readProfiles();
+    const available = list.filter(p => p.tab && !tabHostRegisteredTabs.has(p.name));
+    // return minimal info
+    return available.map(p => ({ name: p.name, job: p.job || '' }));
+  } catch (e) {
+    return [];
+  }
+});
+
+// New: create a tab for an existing profile (clicked from add-menu)
+ipcMain.handle('tabs:create-for-profile', async (_e, { name }) => {
+  try {
+    const p = getProfileByName(name);
+    if (!p) return { ok: false, error: 'Profile not found' };
+    ensureTabAndCreateForProfile(p);
+    const stayOpen = !!settings.stayOpenAfterLaunch;
+    if (launcherWin && !launcherWin.isDestroyed() && !stayOpen) {
+      try { launcherWin.hide(); } catch {}
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
+ipcMain.handle('tabs:open-add-popup', async () => {
+  if (tabHostWin && !tabHostWin.isDestroyed()) {
+    const popup = new BrowserWindow({
+      parent: tabHostWin,
+      modal: true,
+      width: 360,
+      height: 480,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      autoHideMenuBar: true,
+      show: false,
+      frame: true,
+      backgroundColor: '#0b0f16',
+      webPreferences: {
+        nodeIntegration: true,
+        contextIsolation: false,
+      }
+    });
+
+    const list = readProfiles();
+    const available = list.filter(p => p.tab && !tabHostRegisteredTabs.has(p.name));
+
+    const html = `
+      <!doctype html>
+      <html>
+	  <title>Select Profile</title>
+      <head>
+        <meta charset="utf-8" />
+        <style>
+          body {
+            margin:0;
+            background:#0b0f16;
+            color:#e6edf3;
+            font-family:Inter,system-ui;
+            padding:16px;
+          }
+          h2 { margin:0 0 12px 0; font-size:16px; }
+          .item {
+            padding:10px;
+            border:1px solid #1c2533;
+            background:#0f1624;
+            border-radius:8px;
+            margin-bottom:8px;
+            cursor:pointer;
+          }
+          .item:hover { background:#142031; }
+        </style>
+      </head>
+      <body>
+
+        ${
+          available.length
+            ? available
+                .map(
+                  p =>
+                    `<div class="item" data-name="${p.name}">
+                      ${p.name} — ${p.job}
+                    </div>`
+                )
+                .join('')
+            : `<div>No available profiles.</div>`
+        }
+
+        <script>
+          const { ipcRenderer } = require('electron');
+          document.querySelectorAll('.item').forEach(el => {
+            el.addEventListener('click', () => {
+              ipcRenderer.invoke('tabs:create-for-profile', { name: el.dataset.name });
+              window.close();
+            });
+          });
+        </script>
+      </body>
+      </html>
+    `;
+
+    popup.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
+    popup.once("ready-to-show", () => popup.show());
+  }
+});
+
+// New: confirm-close handler for tabs (shows same dialog as standalone window close)
+ipcMain.handle('tabs:confirm-close', async (_e, { name }) => {
+  try {
+    const parent = (tabHostWin && !tabHostWin.isDestroyed()) ? tabHostWin : (launcherWin && !launcherWin.isDestroyed() ? launcherWin : BrowserWindow.getFocusedWindow());
+    // Ask same three-button dialog
+    const res = await dialog.showMessageBox(parent, {
+        type: 'question',
+        buttons: ['Exit Session', 'Exit FlyffU Launcher', 'Cancel'],
+        defaultId: 0,
+        cancelId: 2,
+        title: 'Exit Session',
+        message: 'Exit this game session?',
+        detail: 'Profile: ' + (name || ''),
+        noLink: true,
+        normalizeAccessKeys: true
+    });
+
+    if (res.response === 0) {
+      // Exit Session: close the tab
+      try { closeTabForProfile(name); } catch (e) {}
+      return { ok: true, action: 'exit-session' };
+    } else if (res.response === 1) {
+      // Exit FlyffU Launcher: attempt confirmation if multiple sessions
+      if (getActiveProfileNames().length > 1) {
+        const confirm = await dialog.showMessageBox(parent, {
+            type: 'warning',
+            buttons: ['Yes, Exit All', 'Cancel'],
+            defaultId: 0,
+            cancelId: 1,
+            title: 'Confirm Exit',
+            message: 'Multiple sessions are still running.',
+            detail: 'Are you sure you want to close Flyff Launcher and all running profiles?',
+            noLink: true,
+            normalizeAccessKeys: true
+        });
+        if (confirm.response !== 0) {
+          return { ok: true, action: 'cancelled' };
+        }
+      }
+      exitAppNow();
+      return { ok: true, action: 'exit-all' };
+    } else {
+      // Cancel
+      return { ok: true, action: 'cancelled' };
+    }
+  } catch (e) {
+    console.error('tabs:confirm-close failed', e);
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
+ipcMain.handle('tabs:create-empty', async () => {
+  // Legacy: opens a blank new tab (user double-clicked +). We'll create with a placeholder name.
+  const blankNameBase = 'New Tab';
+  let candidate = blankNameBase;
+  let n = 2;
+  const existing = readProfiles().map(p => p.name);
+  while (existing.includes(candidate)) {
+    candidate = `${blankNameBase} ${n++}`;
+  }
+  // Create a temporary "profile-like" session that doesn't persist to profiles.json (not required by spec)
+  const id = tabIdForProfile(candidate);
+  if (!tabHostWin || tabHostWin.isDestroyed()) createTabHostWindow();
+  try {
+    // create a BrowserView with default partition
+    const tmpProfile = { name: candidate, partition: undefined, muted: false };
+    createBrowserViewForProfile(tmpProfile);
+    tabHostWin.webContents.send('tabs:create', { id, name: candidate, muted: false });
+    tabHostRegisteredTabs.set(candidate, id);
+  } catch (e) {}
+  return { ok: true };
+});
+
+// ---------- UI: Launcher (main window) ----------
 function createLauncher() {
   launcherWin = new BrowserWindow({
     width: 1000,
@@ -753,7 +1654,7 @@ function createLauncher() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      backgroundThrottling: false
+      backgroundThrottling: true
     }
   });
 
@@ -889,7 +1790,6 @@ function createLauncher() {
 
     .card { display:flex; flex-direction:column; border-radius:0; background:transparent; min-height:0; }
     .card-h { flex:0 0 auto; padding:1px 0px 10px 0px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px }
-    .card-h #count { margin-left:auto; }
     .card-c{ flex:1; display:flex; flex-direction:column; padding:1px 12px; min-height:0; }
 
     .news{ border:1px solid var(--line); margin-top:10px; margin-left:-10px; background:var(--panel-2); border-radius:10px; display:flex; flex-direction:column; min-height:0; overflow:hidden; }
@@ -1478,7 +2378,8 @@ function createLauncher() {
           nm.className = 'name';
           const job = (p.job || '').trim();
           const jobTag = job ? ' <span class="tag">'+job+'</span>' : '';
-          nm.innerHTML = name + jobTag;
+          const tabTag = p.tab ? ' <span class="tag">Tabs</span>' : '';
+          nm.innerHTML = name + jobTag + tabTag;
 
           leftWrap.appendChild(dragHandle);
           leftWrap.appendChild(nm);
@@ -1569,11 +2470,31 @@ function createLauncher() {
           const saveBtn = document.createElement('button');
           saveBtn.className = 'btn';
           saveBtn.textContent = 'Save Changes';
+
+          // NEW: Tab checkbox element
+          const tabWrap = document.createElement('div');
+          tabWrap.style.display = 'flex';
+          tabWrap.style.alignItems = 'center';
+          tabWrap.style.gap = '8px';
+          tabWrap.style.marginTop = '8px';
+          const tabCheckbox = document.createElement('input');
+          tabCheckbox.type = 'checkbox';
+          tabCheckbox.id = 'tabtoggle_' + name.replace(/\\s+/g,'_');
+          tabCheckbox.checked = !!p.tab;
+          const tabLabel = document.createElement('label');
+          tabLabel.htmlFor = tabCheckbox.id;
+          tabLabel.style.color = '#9aa7bd';
+          tabLabel.style.fontSize = '13px';
+          tabLabel.textContent = 'Enable Tabbed Window';
+          tabWrap.appendChild(tabCheckbox);
+          tabWrap.appendChild(tabLabel);
+
           saveBtn.onclick = async () => {
             const newName = (renameInput.value || '').trim();
             const newJob = (jobSel.value || '').trim();
+            const newTab = !!tabCheckbox.checked;
             if (!newName) return alert('Enter a valid name');
-            const res = await ipcRenderer.invoke('profiles:update', { from: name, to: newName, job: newJob });
+            const res = await ipcRenderer.invoke('profiles:update', { from: name, to: newName, job: newJob, frame: !!p.frame, tab: newTab });
             if (!res.ok) return alert(res.error || 'Failed to update.');
             manageOpen = newName;
             await refresh();
@@ -1584,7 +2505,7 @@ function createLauncher() {
           frameBtn.className = 'btn';
           frameBtn.textContent = p.frame ? 'Disable Window Frame' : 'Enable Window Frame';
           frameBtn.onclick = async () => {
-            const res = await ipcRenderer.invoke('profiles:update', { from: name, to: name, frame: !p.frame, job: jobSel.value });
+            const res = await ipcRenderer.invoke('profiles:update', { from: name, to: name, frame: !p.frame, job: jobSel.value, tab: !!tabCheckbox.checked });
             if (!res.ok) return alert(res.error || 'Failed to update.');
             await refresh();
             showToast('Window frame ' + (!p.frame ? 'enabled' : 'disabled') + '.');
@@ -1593,6 +2514,7 @@ function createLauncher() {
           saveRow.appendChild(saveBtn);
           saveRow.appendChild(frameBtn);
           m.appendChild(renameWrap);
+          m.appendChild(tabWrap);
           m.appendChild(saveRow);
 
           const authRow = document.createElement('div');
@@ -1917,6 +2839,18 @@ function launchGameWithProfile(name) {
   const part = partitionForProfile(profile);
   const url = 'https://universe.flyff.com/play';
 
+  // If profile has tab enabled, send to tab host
+  if (profile.tab) {
+    ensureTabAndCreateForProfile(profile);
+    // Optionally hide launcher if configured
+    const stayOpen = !!settings.stayOpenAfterLaunch;
+    if (launcherWin && !launcherWin.isDestroyed() && !stayOpen) {
+      try { launcherWin.hide(); } catch {}
+    }
+    return;
+  }
+
+  // Standalone window logic (unchanged)
   const { opts: winStateOpts, postCreate } = applyWinStateOptionsFromProfile(profile);
 
   const win = new BrowserWindow({
@@ -1929,11 +2863,13 @@ function launchGameWithProfile(name) {
     frame: !!profile.frame,
     icon: 'icon.png',
     webPreferences: {
-      backgroundThrottling: false,
+      backgroundThrottling: true,
       partition: part,
       nativeWindowOpen: true
     }
   });
+  
+  disableBrowserShortcuts(win.webContents);
 
   win.__profileName = name;
   
@@ -1986,7 +2922,7 @@ function launchGameWithProfile(name) {
                 cancelId: 1,
                 title: 'Confirm Exit',
                 message: 'Multiple sessions are still running.',
-                detail: 'Are you sure you want to close FlyffU Launcher and all running profiles?',
+                detail: 'Are you sure you want to close Flyff Universe and all running profiles?',
                 noLink: true,
                 normalizeAccessKeys: true
             });
@@ -2020,7 +2956,7 @@ function launchGameWithProfile(name) {
         height: 700,
         webPreferences: {
           partition: part,
-          backgroundThrottling: false
+          backgroundThrottling: true
         }
       }
     };
@@ -2135,7 +3071,7 @@ ipcMain.handle('profiles:add', async (_e, payload) => {
 
   const job = JOBS_SET.has((jobInput || '').trim()) ? (jobInput || '').trim() : DEFAULT_JOB;
 
-  const profile = { name, job, partition: partitionForProfile({ name }), frame: true, isClone: false, winState: undefined };
+  const profile = { name, job, partition: partitionForProfile({ name }), frame: true, isClone: false, winState: undefined, muted: false, tab: false };
   writeProfiles([...list, profile]);
   if (launcherWin) launcherWin.webContents.send('profiles:updated');
   return { ok: true };
@@ -2162,7 +3098,9 @@ ipcMain.handle('profiles:clone', async (_e, { name }) => {
     partition: newPartition,
     frame: !!src.frame,
     isClone: true,
-    winState: src.winState ? { ...src.winState } : undefined
+    winState: src.winState ? { ...src.winState } : undefined,
+    muted: !!src.muted,
+    tab: !!src.tab
   };
 
   writeProfiles([...list, cloned]);
@@ -2195,7 +3133,7 @@ ipcMain.handle('profiles:reorder', async (_e, orderNames) => {
   return { ok: true };
 });
 
-ipcMain.handle('profiles:update', async (_e, { from, to, frame, job }) => {
+ipcMain.handle('profiles:update', async (_e, { from, to, frame, job, tab }) => {
   const list = readProfiles();
   const idx = getProfileIndex(list, from);
   if (idx === -1) return { ok: false, error: 'Profile not found' };
@@ -2215,15 +3153,47 @@ ipcMain.handle('profiles:update', async (_e, { from, to, frame, job }) => {
     }
   }
 
+  // handle moving tabs registrations if name changed
+  if (newName !== from && tabWebContentsMap.has(from)) {
+    const wcId = tabWebContentsMap.get(from);
+    tabWebContentsMap.delete(from);
+    tabWebContentsMap.set(newName, wcId);
+    const regId = tabHostRegisteredTabs.get(from);
+    tabHostRegisteredTabs.delete(from);
+    tabHostRegisteredTabs.set(newName, regId);
+    // move BrowserView instance if exists
+    if (browserViewsMap.has(from)) {
+      const bv = browserViewsMap.get(from);
+      browserViewsMap.delete(from);
+      browserViewsMap.set(newName, bv);
+    }
+    // notify host to rename tab if running
+    if (tabHostWin && !tabHostWin.isDestroyed()) {
+      try {
+        tabHostWin.webContents.send('tabs:close', { id: tabIdForProfile(from) });
+        tabHostWin.webContents.send('tabs:create', { id: tabIdForProfile(newName), name: newName, muted: !!list[idx].muted });
+      } catch (e) {}
+    }
+  }
+
   const oldPartition = list[idx].partition || partitionForProfile(list[idx]);
   const wasClone = typeof list[idx].isClone === 'boolean' ? list[idx].isClone : inferIsCloneFromName(list[idx].name);
   const nextJob = JOBS_SET.has((job || '').trim()) ? (job || '').trim() : (list[idx].job || DEFAULT_JOB);
+
+  const nextTabFlag = (typeof tab === 'boolean') ? tab : !!list[idx].tab;
+
+  // if toggling tab off and there is a running tab -> close it and open standalone window?
+  if (list[idx].tab && !nextTabFlag) {
+    // tab was enabled, now being disabled: if there's a running tab, close it
+    try { closeTabForProfile(list[idx].name); } catch (e) {}
+  }
 
   list[idx].name = newName;
   list[idx].partition = oldPartition;
   list[idx].frame = (typeof frame === 'boolean') ? frame : !!list[idx].frame;
   list[idx].isClone = wasClone;
   list[idx].job = nextJob;
+  list[idx].tab = !!nextTabFlag;
 
   writeProfiles(list);
 
@@ -2282,6 +3252,7 @@ ipcMain.handle('profiles:delete', async (_e, { name, clear }) => {
   if (!p) return { ok: false, error: 'Profile not found' };
   const part = partitionForProfile(p);
 
+  // Close any running standalone windows
   if (gameWindows.has(name)) {
     for (const w of gameWindows.get(name)) {
       try {
@@ -2290,6 +3261,11 @@ ipcMain.handle('profiles:delete', async (_e, { name, clear }) => {
       } catch {}
     }
     gameWindows.delete(name);
+  }
+
+  // Close any running tab for this profile
+  if (p.tab) {
+    try { closeTabForProfile(name); } catch (e) {}
   }
 
   const next = list.filter(x => x.name !== name);
@@ -2403,29 +3379,89 @@ ipcMain.handle('profiles:launch', async (_e, payload) => {
 });
 
 ipcMain.handle('profiles:quit', async (_e, name) => {
-  if (gameWindows.has(name)) {
-    for (const w of gameWindows.get(name)) {
-      try { if (!w.isDestroyed()) w.close(); } catch {}
+  try {
+    // 1. Pick the correct parent window (profile window > tabHost > launcher)
+    let parent = null;
+
+    // Standalone game windows first
+    const wins = getAllGameWindowsForProfile(name);
+    if (wins.length > 0 && wins[0] && !wins[0].isDestroyed()) {
+      parent = wins[0];
     }
+    // Tab host next
+    else if (tabHostWin && !tabHostWin.isDestroyed()) {
+      parent = tabHostWin;
+    }
+    // Launcher last fallback
+    else if (launcherWin && !launcherWin.isDestroyed()) {
+      parent = launcherWin;
+    }
+    // Worst-case: whatever is focused
+    else {
+      parent = BrowserWindow.getFocusedWindow();
+    }
+
+    // 2. Show quit dialog ON THE PROFILE WINDOW (not launcher)
+    const res = await dialog.showMessageBox(parent, {
+      type: 'question',
+      buttons: ['Exit Session', 'Exit FlyffU Launcher', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      title: 'Exit Session',
+      message: 'Exit this game session?',
+      detail: 'Profile: ' + name,
+      noLink: true,
+      normalizeAccessKeys: true
+    });
+
+    // 3. Exit Session
+    if (res.response === 0) {
+      if (gameWindows.has(name)) {
+        for (const w of Array.from(gameWindows.get(name))) {
+          if (w && !w.isDestroyed()) {
+            // IMPORTANT: prevent the profile window from showing its OWN exit prompt
+            w.__confirmedClose = true;
+            try { w.close(); } catch {}
+          }
+        }
+        gameWindows.delete(name);
+      }
+
+      // Close tab if it exists
+      try { closeTabForProfile(name); } catch {}
+
+      return { ok: true };
+    }
+
+    // 4. Exit Launcher
+    if (res.response === 1) {
+      exitAppNow();
+      return { ok: true };
+    }
+
+    // 5. Cancel
+    return { ok: true, cancelled: true };
+
+  } catch (e) {
+    console.error('profiles:quit failed', e);
+    return { ok: false, error: String(e) };
   }
-  return { ok: true };
 });
 
 ipcMain.handle('profiles:focus', async (_e, name) => {
+  // Focus standalone windows if present
   const wins = getAllGameWindowsForProfile(name);
-  if (!wins.length) return { ok: false, error: 'No session running' };
-
-  const target = wins[0];
-  if (target && !target.isDestroyed()) {
-    try {
-      target.show();
-      target.focus();
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, error: e.message };
+  if (wins.length > 0) {
+    const target = wins[0];
+    if (target && !target.isDestroyed()) {
+      try { target.show(); target.focus(); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
     }
   }
-  return { ok: false, error: 'Window destroyed' };
+
+  // else focus tab
+  const res = focusTabForProfile(name);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: 'No session running' };
 });
 
 ipcMain.handle('profiles:audio-state', async (_e, name) => {
@@ -2435,6 +3471,19 @@ ipcMain.handle('profiles:audio-state', async (_e, name) => {
 
   const wins = getAllGameWindowsForProfile(name);
   if (wins.length === 0) {
+    // check tab
+    const wcId = tabWebContentsMap.get(name);
+    if (wcId) {
+      try {
+        const wc = webContents.fromId(wcId);
+        if (wc) {
+          const muted = wc.isAudioMuted();
+          list[idx].muted = muted;
+          writeProfiles(list);
+          return { ok: true, muted };
+        }
+      } catch {}
+    }
     return { ok: true, muted: !!list[idx].muted };
   }
 
@@ -2455,7 +3504,24 @@ ipcMain.handle('profiles:toggle-audio', async (_e, name) => {
   const wins = getAllGameWindowsForProfile(name);
   let next;
   if (wins.length === 0) {
-    next = !list[idx].muted;
+    // toggle tab audio if exists
+    const wcId = tabWebContentsMap.get(name);
+    if (wcId) {
+      try {
+        const wc = webContents.fromId(wcId);
+        if (wc) {
+          const currentlyMuted = wc.isAudioMuted();
+          next = !currentlyMuted;
+          wc.setAudioMuted(next);
+        } else {
+          next = !list[idx].muted;
+        }
+      } catch (e) {
+        next = !list[idx].muted;
+      }
+    } else {
+      next = !list[idx].muted;
+    }
   } else {
     const currentlyMuted = wins.every(w => w.webContents.isAudioMuted());
     next = !currentlyMuted;
@@ -2610,7 +3676,7 @@ ipcMain.handle('ui:about', async () => {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      backgroundThrottling: false,
+      backgroundThrottling: true,
     },
   });
 
@@ -2632,8 +3698,7 @@ ipcMain.handle('ui:about', async () => {
       .sub{font-size:12px;color:var(--sub)}
 	  .abt{font-size:12px;justify-content:center;align-items:center}
       .row{font-size:13px;margin:6px 2px;letter-spacing:.2px;display:flex;justify-content:center;align-items:center;gap:14px;flex-wrap:wrap;}.row a{color:#9ab4ff;text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px;}.row a:hover{filter:brightness(1.15);}
-      a{color:#8fbaff;text-decoration:none}
-      a:hover{text-decoration:underline}
+
     </style>
   </head>
   
@@ -2706,7 +3771,7 @@ ipcMain.handle('ui:shortcuts', async () => {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      backgroundThrottling: false,
+      backgroundThrottling: true,
     },
   });
 
@@ -2721,7 +3786,7 @@ ipcMain.handle('ui:shortcuts', async () => {
       *{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial}
       html,body{height:100%}
       body{margin:0;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center}
-      .wrap{width:min(92vw,460px);padding:12px}
+      .wrap{width:min(92vw,460px);Padding:12px}
       .list{display:flex;flex-direction:column;gap:8px}
       .item{display:flex;align-items:center;justify-content:space-between;background:#0f1624;border:1px solid #1e2a3e;border-radius:8px;padding:10px 12px}
       .label{font-size:13px;color:#d6e6ff}
@@ -2736,8 +3801,8 @@ ipcMain.handle('ui:shortcuts', async () => {
         <div class="item"><div class="label">Toggle Launcher</div><div class="kbd">Ctrl + Shift + L</div></div>
 		<div class="item"><div class="label">Mute/Unmute focused session</div><div class="kbd">Ctrl + Shift + M</div></div>
         <div class="item"><div class="label">Screenshot focused session</div><div class="kbd">Ctrl + Shift + P</div></div>
-		<div class="item"><div class="label">Cycle forward active sessions</div><div class="kbd">Ctrl + Tab</div></div>
-		<div class="item"><div class="label">Cycle backward active sessions</div><div class="kbd">Ctrl + Shift + Tab</div></div>
+		<div class="item"><div class="label">Cycle forward through active tabbed sessions</div><div class="kbd">Ctrl + Tab</div></div>
+		<div class="item"><div class="label">Cycle backward through active tabbed sessions</div><div class="kbd">Ctrl + Shift + Tab</div></div>
       </div>
     </div>
     <script>
