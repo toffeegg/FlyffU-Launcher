@@ -1,0 +1,41 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build Electron App
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            npm run dist:win
+          else
+            npm run dist:mac
+          fi
+
+      - name: Upload Release Artifacts
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: true
+          files: "dist/**"
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
